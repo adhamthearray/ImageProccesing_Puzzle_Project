@@ -17,27 +17,27 @@ def analyze_image(gray):
     return mean_intensity, contrast, laplacian_var
 
 def adaptive_parameters(mean_intensity, contrast, laplacian_var):
-    # Bilateral
     if laplacian_var > 150:
         d, sigmaColor, sigmaSpace = 5, 30, 30
     elif laplacian_var > 70:
         d, sigmaColor, sigmaSpace = 7, 60, 60
     else:
         d, sigmaColor, sigmaSpace = 11, 90, 90
-    # Threshold
+
     if mean_intensity < 90:
         blockSize, C = 15, 3
     elif mean_intensity < 140:
         blockSize, C = 11, 5
     else:
         blockSize, C = 9, 2
-    # Unsharp
+
     if contrast < 30:
         alpha, beta = 1.8, -0.6
     elif contrast < 60:
         alpha, beta = 1.5, -0.5
     else:
         alpha, beta = 1.2, -0.3
+
     return d, sigmaColor, sigmaSpace, blockSize, C, alpha, beta
 
 # ---------------- MAIN LOOP ----------------
@@ -52,39 +52,53 @@ for filename in os.listdir(image_folder):
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # -------- IMAGE ANALYSIS --------
     mean_intensity, contrast, lap_var = analyze_image(gray)
     print(f"\n{filename} Analysis -> Brightness: {mean_intensity:.2f}, Contrast: {contrast:.2f}, Sharpness: {lap_var:.2f}")
 
-    # -------- ADAPTIVE PARAMETERS --------
     d, sigmaColor, sigmaSpace, blockSize, C, alpha, beta = adaptive_parameters(mean_intensity, contrast, lap_var)
 
-    # -------- ENHANCEMENT --------
+    # -------- ENHANCEMENT PIPELINE --------
     denoised = cv2.bilateralFilter(gray, d, sigmaColor, sigmaSpace)
-    blurred = cv2.GaussianBlur(denoised, (0,0), 1.5)
+    blurred = cv2.GaussianBlur(denoised, (0, 0), 1.5)
     sharpened = cv2.addWeighted(denoised, alpha, blurred, beta, 0)
-    enhanced = cv2.adaptiveThreshold(sharpened, 255,
-                                     cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                     cv2.THRESH_BINARY_INV, blockSize, C)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+
+    enhanced = cv2.adaptiveThreshold(
+        sharpened, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, blockSize, C
+    )
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     clean = cv2.morphologyEx(enhanced, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    # -------- FIND STRONGEST HORIZONTAL & VERTICAL --------
+    # -------- PROJECTION LINE DETECTION --------
     h_proj = np.sum(clean, axis=1)
     v_proj = np.sum(clean, axis=0)
 
-    h_cut = np.argmax(h_proj)
-    v_cut = np.argmax(v_proj)
+    margin_h = int(clean.shape[0] * 0.1)
+    margin_v = int(clean.shape[1] * 0.1)
+
+    h_cut = np.argmax(h_proj[margin_h:-margin_h]) + margin_h
+    v_cut = np.argmax(v_proj[margin_v:-margin_v]) + margin_v
+
+    # Strength validation
+    if h_proj[h_cut] < np.mean(h_proj) * 1.4 or v_proj[v_cut] < np.mean(v_proj) * 1.4:
+        print("⚠ Weak separator detected - possible segmentation risk")
 
     # -------- VISUALIZATION --------
+    vis = img.copy()
+    cv2.line(vis, (0, h_cut), (vis.shape[1], h_cut), (0, 0, 255), 2)   # horizontal - RED
+    cv2.line(vis, (v_cut, 0), (v_cut, vis.shape[0]), (255, 0, 0), 2)  # vertical - BLUE
 
+    cv2.imshow("Detected Separator Lines", vis)
+    cv2.waitKey(500)  # Adjust delay if needed
 
     # -------- SLICE EXACTLY 4 PIECES --------
     cuts = [
-        (0, h_cut, 0, v_cut),        # top-left
-        (0, h_cut, v_cut, clean.shape[1]),  # top-right
-        (h_cut, clean.shape[0], 0, v_cut),  # bottom-left
-        (h_cut, clean.shape[0], v_cut, clean.shape[1])  # bottom-right
+        (0, h_cut, 0, v_cut),
+        (0, h_cut, v_cut, clean.shape[1]),
+        (h_cut, clean.shape[0], 0, v_cut),
+        (h_cut, clean.shape[0], v_cut, clean.shape[1])
     ]
 
     count = 0
@@ -93,8 +107,10 @@ for filename in os.listdir(image_folder):
         if piece.size == 0:
             continue
         piece_path = os.path.join(pieces_folder,
-                                  f"{os.path.splitext(filename)[0]}piece{count}.png")
+                                  f"{os.path.splitext(filename)[0]}_piece_{count}.png")
         cv2.imwrite(piece_path, piece)
         count += 1
 
     print(f"{filename} → {count} sub-images extracted (exact 4 pieces)")
+
+cv2.destroyAllWindows()
