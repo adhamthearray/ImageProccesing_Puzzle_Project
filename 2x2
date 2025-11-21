@@ -17,27 +17,27 @@ def analyze_image(gray):
     return mean_intensity, contrast, laplacian_var
 
 def adaptive_parameters(mean_intensity, contrast, laplacian_var):
-    # Bilateral
     if laplacian_var > 150:
         d, sigmaColor, sigmaSpace = 5, 30, 30
     elif laplacian_var > 70:
         d, sigmaColor, sigmaSpace = 7, 60, 60
     else:
         d, sigmaColor, sigmaSpace = 11, 90, 90
-    # Threshold
+
     if mean_intensity < 90:
         blockSize, C = 15, 3
     elif mean_intensity < 140:
         blockSize, C = 11, 5
     else:
         blockSize, C = 9, 2
-    # Unsharp
+
     if contrast < 30:
         alpha, beta = 1.8, -0.6
     elif contrast < 60:
         alpha, beta = 1.5, -0.5
     else:
         alpha, beta = 1.2, -0.3
+
     return d, sigmaColor, sigmaSpace, blockSize, C, alpha, beta
 
 def unsharp_mask(image, alpha=1.5, beta=-0.5, blur_sigma=1.5):
@@ -55,8 +55,7 @@ for filename in os.listdir(image_folder):
         continue
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # Optional: enhance contrast for dim images
-    gray = cv2.equalizeHist(gray)
+    gray = cv2.equalizeHist(gray)  # optional contrast boost
 
     mean_intensity, contrast, lap_var = analyze_image(gray)
     d, sigmaColor, sigmaSpace, blockSize, C, alpha, beta = adaptive_parameters(mean_intensity, contrast, lap_var)
@@ -64,7 +63,6 @@ for filename in os.listdir(image_folder):
     # -------- ENHANCEMENT PIPELINE --------
     denoised = cv2.bilateralFilter(gray, d, sigmaColor, sigmaSpace)
     sharpened = unsharp_mask(denoised, alpha, beta)
-
     enhanced = cv2.adaptiveThreshold(
         sharpened, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -81,22 +79,35 @@ for filename in os.listdir(image_folder):
 
     h_proj = np.sum(sobel_h, axis=1)
     v_proj = np.sum(sobel_v, axis=0)
-
-    # Smooth projections to reduce spike errors
     h_proj = cv2.GaussianBlur(h_proj.reshape(-1,1), (5,1), 0).flatten()
     v_proj = cv2.GaussianBlur(v_proj.reshape(1,-1), (1,5), 0).flatten()
 
-    # Choose cut lines near center
+    # -------- PICK CUTS WITH AUTO-CENTER LOGIC --------
     center_h = clean.shape[0] // 2
     center_v = clean.shape[1] // 2
-    h_candidates = np.argsort(h_proj)[-5:]  # top 5 horizontal peaks
-    v_candidates = np.argsort(v_proj)[-5:]  # top 5 vertical peaks
-    h_cut = min(h_candidates, key=lambda x: abs(x - center_h))
-    v_cut = min(v_candidates, key=lambda x: abs(x - center_v))
 
-    # Strength validation
+    # Find strongest edges
+    h_peak = np.argmax(h_proj)
+    v_peak = np.argmax(v_proj)
+
+    # Safety margin: if peak is too close to top/bottom or left/right, ignore it and take center
+    margin_ratio = 0.2  # 20% from borders considered “too close”
+    margin_h = int(clean.shape[0] * margin_ratio)
+    margin_v = int(clean.shape[1] * margin_ratio)
+
+    if h_peak < margin_h or h_peak > clean.shape[0] - margin_h:
+        h_cut = center_h
+    else:
+        h_cut = h_peak
+
+    if v_peak < margin_v or v_peak > clean.shape[1] - margin_v:
+        v_cut = center_v
+    else:
+        v_cut = v_peak
+
+    # Strength validation (optional warning)
     if h_proj[h_cut] < np.mean(h_proj)*1.2 or v_proj[v_cut] < np.mean(v_proj)*1.2:
-        print("⚠ Weak separator detected - possible segmentation risk")
+        print(f"⚠ Weak separator detected in {filename}")
 
     # -------- VISUALIZATION --------
     vis = img.copy()
@@ -106,7 +117,7 @@ for filename in os.listdir(image_folder):
     print("👉 Press any key to continue...")
     key = cv2.waitKey(0)
     cv2.destroyAllWindows()
-    if key == 27:  # ESC to exit
+    if key == 27:
         break
 
     # -------- SLICE EXACTLY 4 PIECES --------
@@ -121,7 +132,7 @@ for filename in os.listdir(image_folder):
         piece = img[y1:y2,x1:x2]
         if piece.size == 0:
             continue
-        piece_path = os.path.join(pieces_folder, f"{os.path.splitext(filename)[0]}_piece_{count}.png")
+        piece_path = os.path.join(pieces_folder, f"{os.path.splitext(filename)[0]}piece{count}.png")
         cv2.imwrite(piece_path, piece)
         count += 1
 
