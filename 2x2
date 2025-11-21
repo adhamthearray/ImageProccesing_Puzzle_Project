@@ -82,28 +82,25 @@ for filename in os.listdir(image_folder):
     h_proj = cv2.GaussianBlur(h_proj.reshape(-1,1), (5,1), 0).flatten()
     v_proj = cv2.GaussianBlur(v_proj.reshape(1,-1), (1,5), 0).flatten()
 
-    # -------- PICK CUTS WITH AUTO-CENTER LOGIC --------
+    # -------- PICK CUTS WITH TOP-5 + AUTO-CENTER LOGIC --------
     center_h = clean.shape[0] // 2
     center_v = clean.shape[1] // 2
 
-    # Find strongest edges
-    h_peak = np.argmax(h_proj)
-    v_peak = np.argmax(v_proj)
+    # Top 5 strongest peaks
+    h_candidates = np.argsort(h_proj)[-5:]
+    v_candidates = np.argsort(v_proj)[-5:]
 
-    # Safety margin: if peak is too close to top/bottom or left/right, ignore it and take center
-    margin_ratio = 0.2  # 20% from borders considered “too close”
+    # Choose closest to center
+    h_peak = min(h_candidates, key=lambda x: abs(x - center_h))
+    v_peak = min(v_candidates, key=lambda x: abs(x - center_v))
+
+    # Safety margin fallback
+    margin_ratio = 0.2
     margin_h = int(clean.shape[0] * margin_ratio)
     margin_v = int(clean.shape[1] * margin_ratio)
 
-    if h_peak < margin_h or h_peak > clean.shape[0] - margin_h:
-        h_cut = center_h
-    else:
-        h_cut = h_peak
-
-    if v_peak < margin_v or v_peak > clean.shape[1] - margin_v:
-        v_cut = center_v
-    else:
-        v_cut = v_peak
+    h_cut = h_peak if margin_h <= h_peak <= clean.shape[0]-margin_h else center_h
+    v_cut = v_peak if margin_v <= v_peak <= clean.shape[1]-margin_v else center_v
 
     # Strength validation (optional warning)
     if h_proj[h_cut] < np.mean(h_proj)*1.2 or v_proj[v_cut] < np.mean(v_proj)*1.2:
@@ -132,7 +129,7 @@ for filename in os.listdir(image_folder):
         piece = img[y1:y2,x1:x2]
         if piece.size == 0:
             continue
-        piece_path = os.path.join(pieces_folder, f"{os.path.splitext(filename)[0]}piece{count}.png")
+        piece_path = os.path.join(pieces_folder, f"{os.path.splitext(filename)[0]}_piece_{count}.png")
         cv2.imwrite(piece_path, piece)
         count += 1
 
