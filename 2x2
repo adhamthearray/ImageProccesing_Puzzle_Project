@@ -87,12 +87,12 @@ for filename in os.listdir(image_folder):
     center_v = clean.shape[1] // 2
 
     # Top 5 strongest peaks
-    h_candidates = np.argsort(h_proj)[-5:]
-    v_candidates = np.argsort(v_proj)[-5:]
+    h_candidates = np.argsort(h_proj)[-30:]
+    v_candidates = np.argsort(v_proj)[-30:]
 
     # Choose closest to center
-    h_peak = min(h_candidates, key=lambda x: abs(x - center_h))
-    v_peak = min(v_candidates, key=lambda x: abs(x - center_v))
+    h_peak = min(h_proj, key=lambda x: abs(x - center_h))
+    v_peak = min(v_proj, key=lambda x: abs(x - center_v))
 
     # Safety margin fallback
     margin_ratio = 0.2
