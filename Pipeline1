@@ -1,0 +1,205 @@
+import cv2
+import numpy as np
+import os
+
+# ---------------- PATHS ----------------
+image_folder = r"C:\puzzle_2x2"
+output_folder = r"C:\output_2x2"
+os.makedirs(output_folder, exist_ok=True)
+
+# ---------------- HELPER FUNCTIONS (unchanged) ----------------
+def get_puzzle_size_from_folder(folder_name):
+    folder_lower = folder_name.lower()
+    if "8x8" in folder_lower:
+        return 8, 8
+    elif "4x4" in folder_lower:
+        return 4, 4
+    elif "2x2" in folder_lower:
+        return 2, 2
+    else:
+        return 2, 2
+
+def split_image(img, rows, cols):
+    pieces = []
+    h, w = img.shape[:2]
+    h_step, w_step = h // rows, w // cols
+    for i in range(rows):
+        for j in range(cols):
+            y1 = i * h_step
+            y2 = h if i == rows - 1 else (i + 1) * h_step
+            x1 = j * w_step
+            x2 = w if j == cols - 1 else (j + 1) * w_step
+            piece = img[y1:y2, x1:x2]
+            pieces.append(piece)
+    return pieces
+
+def analyze_piece(gray):
+    mean_intensity = np.mean(gray)
+    contrast = np.std(gray)
+    laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    return mean_intensity, contrast, laplacian_var
+
+def adaptive_parameters(mean_intensity, contrast, laplacian_var):
+    # Bilateral
+    if laplacian_var > 150:
+        d, sigmaColor, sigmaSpace = 5, 30, 30
+    elif laplacian_var > 70:
+        d, sigmaColor, sigmaSpace = 7, 60, 60
+    else:
+        d, sigmaColor, sigmaSpace = 11, 90, 90
+
+    # Adaptive threshold
+    if mean_intensity < 90:
+        blockSize, C = 15, 3
+    elif mean_intensity < 140:
+        blockSize, C = 11, 5
+    else:
+        blockSize, C = 9, 2
+
+    # Unsharp
+    if contrast < 30:
+        alpha, beta = 1.8, -0.6
+    elif contrast < 60:
+        alpha, beta = 1.5, -0.5
+    else:
+        alpha, beta = 1.2, -0.3
+
+    return d, sigmaColor, sigmaSpace, blockSize, C, alpha, beta
+
+def unsharp_mask(image, alpha=1.5, beta=-0.5, sigma=1.5):
+    blurred = cv2.GaussianBlur(image, (0, 0), sigma)
+    return cv2.addWeighted(image, alpha, blurred, beta, 0)
+
+def process_piece(piece):
+    gray = cv2.cvtColor(piece, cv2.COLOR_BGR2GRAY)
+    mean_i, cont, lap_var = analyze_piece(gray)
+    d, sc, ss, blockSize, C, alpha, beta = adaptive_parameters(mean_i, cont, lap_var)
+
+    denoised = cv2.bilateralFilter(gray, d, sc, ss)
+    sharpened = unsharp_mask(denoised, alpha, beta)
+    equalized = cv2.equalizeHist(sharpened)
+
+    # Adaptive threshold + closing
+    binary = cv2.adaptiveThreshold(
+        equalized, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        blockSize if blockSize % 2 == 1 else blockSize + 1, C
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    return equalized, binary
+
+# ---------------- MAIN PROCESSING LOOP ----------------
+for root, dirs, files in os.walk(image_folder):
+    for filename in files:
+        if not filename.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
+            continue
+
+        img_path = os.path.join(root, filename)
+        img = cv2.imread(img_path)
+        if img is None:
+            continue
+
+        rows, cols = get_puzzle_size_from_folder(os.path.basename(root))
+        pieces = split_image(img, rows, cols)
+
+        rel_path = os.path.relpath(root, image_folder)
+        base_output = os.path.join(output_folder, rel_path, os.path.splitext(filename)[0])
+        os.makedirs(base_output, exist_ok=True)
+
+        print(f"Processing {filename} → {rows}x{cols} ({len(pieces)} pieces)")
+
+        for idx, piece in enumerate(pieces):
+            if piece.size == 0:
+                continue
+            gray_final, binary_edge = process_piece(piece)
+
+            cv2.imwrite(os.path.join(base_output, f"piece_{idx:02d}_gray.png"), gray_final)
+            cv2.imwrite(os.path.join(base_output, f"piece_{idx:02d}_edge.png"), binary_edge)
+            cv2.imwrite(os.path.join(base_output, f"piece_{idx:02d}_original.png"), piece)
+
+        print(f"   → Saved to {base_output}")
+
+print("\nAll images processed successfully!")
+
+# ---------------- FIXED VISUALIZATION ----------------
+def visualize_all_results():
+    print("Building montages for visualization...")
+
+    for root, dirs, files in os.walk(output_folder):
+        gray_files = sorted([f for f in os.listdir(root) if f.endswith("_gray.png")])
+        if not gray_files:
+            continue
+
+        # Determine grid size from number of pieces
+        n = len(gray_files)
+        if n == 4:
+            rows, cols = 2, 2
+        elif n == 16:
+            rows, cols = 4, 4
+        elif n == 64:
+            rows, cols = 8, 8
+        else:
+            print(f"Skipping {root}: unexpected number of pieces ({n})")
+            continue
+
+        # Load all pieces
+        gray_pieces = []
+        edge_pieces = []
+        missing = False
+        for i in range(rows * cols):
+            idx = f"{i:02d}"
+            g_path = os.path.join(root, f"piece_{idx}_gray.png")
+            e_path = os.path.join(root, f"piece_{idx}_edge.png")
+            if not (os.path.exists(g_path) and os.path.exists(e_path)):
+                print(f"Missing piece_{idx} in {root}")
+                missing = True
+                break
+            gray_pieces.append(cv2.imread(g_path, cv2.IMREAD_GRAYSCALE))
+            edge_pieces.append(cv2.imread(e_path, cv2.IMREAD_GRAYSCALE))
+        if missing:
+            continue
+
+        # Make all pieces same size
+        max_h = max(p.shape[0] for p in gray_pieces)
+        max_w = max(p.shape[1] for p in gray_pieces)
+
+        def pad_to_size(img):
+            pad_h = max_h - img.shape[0]
+            pad_w = max_w - img.shape[1]
+            top = pad_h // 2
+            bottom = pad_h - top
+            left = pad_w // 2
+            right = pad_w - left
+            return cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=255)
+
+        gray_pieces = [pad_to_size(p) for p in gray_pieces]
+        edge_pieces = [pad_to_size(p) for p in edge_pieces]
+
+        # Build montages
+        gray_montage = np.vstack([np.hstack(gray_pieces[i*cols:(i+1)*cols]) for i in range(rows)])
+        edge_montage = np.vstack([np.hstack(edge_pieces[i*cols:(i+1)*cols]) for i in range(rows)])
+
+        # Title
+        title = os.path.relpath(root, output_folder).replace("\\", "/")
+
+        # Display
+        scale = 900 / max(gray_montage.shape)
+        if scale < 1:
+            gray_disp = cv2.resize(gray_montage, None, fx=scale, fy=scale)
+            edge_disp = cv2.resize(edge_montage, None, fx=scale, fy=scale)
+        else:
+            gray_disp, edge_disp = gray_montage, edge_montage
+
+        cv2.imshow(f"Grayscale - {title} [{rows}x{cols}]", gray_disp)
+        cv2.imshow(f"Edges - {title} [{rows}x{cols}]", edge_disp)
+
+    if cv2.getWindowProperty(f"Grayscale - {title} [{rows}x{cols}]", cv2.WND_PROP_VISIBLE) >= 0:
+        print("Visualization ready! Close any window to exit.")
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+    else:
+        print("No complete puzzle found for visualization.")
+
+# ---------------- RUN VISUALIZATION ----------------
