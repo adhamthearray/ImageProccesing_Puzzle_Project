@@ -1,0 +1,141 @@
+import cv2
+import numpy as np
+import os
+from matplotlib import pyplot as plt
+from google.colab import files
+import zipfile
+
+def show(img, title=""):
+    plt.figure(figsize=(5,5))
+    if len(img.shape)==2:
+        plt.imshow(img, cmap='gray')
+    else:
+        plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+print("Upload a ZIP file containing 2x2 puzzle images")
+uploaded = files.upload()
+zip_filename = next(iter(uploaded))
+extract_folder = zip_filename.replace(".zip","")
+os.makedirs(extract_folder, exist_ok=True)
+with zipfile.ZipFile(zip_filename, 'r') as zip_ref:
+    zip_ref.extractall(extract_folder)
+print("ZIP extracted to folder:", extract_folder)
+
+def cut_into_4(img):
+    h, w = img.shape[:2]
+
+    # If image is too small, return the original
+    if h < 4 or w < 4:
+        return [img, img, img, img]
+
+    mid_h = h // 2
+    mid_w = w // 2
+
+    pieces = [
+        img[0:mid_h, 0:mid_w],       # Top-left
+        img[0:mid_h, mid_w:w],       # Top-right
+        img[mid_h:h, 0:mid_w],       # Bottom-left
+        img[mid_h:h, mid_w:w]        # Bottom-right
+    ]
+
+    # Filter any empty slices
+    pieces = [p for p in pieces if p.size > 0]
+
+    return pieces
+
+def cut_into_16(img):
+    h, w = img.shape[:2]
+    step_h = h // 4
+    step_w = w // 4
+
+    pieces = []
+
+    for i in range(4):
+        for j in range(4):
+            y1 = i * step_h
+            y2 = (i + 1) * step_h if i < 3 else h
+
+            x1 = j * step_w
+            x2 = (j + 1) * step_w if j < 3 else w
+
+            crop = img[y1:y2, x1:x2]
+            #if not is_empty(crop):
+            pieces.append(crop)
+
+    return pieces
+
+def cut_into_64(img):
+    h, w = img.shape[:2]
+    step_h = h // 8
+    step_w = w // 8
+
+    pieces = []
+
+    for i in range(8):
+        for j in range(8):
+            y1 = i * step_h
+            y2 = (i + 1) * step_h if i < 7 else h
+
+            x1 = j * step_w
+            x2 = (j + 1) * step_w if j < 7 else w
+
+            crop = img[y1:y2, x1:x2]
+            #if not is_empty(crop):
+            pieces.append(crop)
+
+    return pieces
+
+
+
+def preprocess_2x2(img):
+   #changing to gray scale
+      gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+   #Noise Removal by Bilateral
+
+      filtered = cv2.bilateralFilter(gray, d=3, sigmaColor=20, sigmaSpace=20)
+
+
+   #Illumination Correction
+      clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+      enhanced = clahe.apply(filtered)
+   #edges
+      kernel = np.array([[0, -1, 0],
+                   [-1, 5, -1],
+                   [0, -1, 0]])
+
+      sharpened = cv2.filter2D(enhanced, -1, kernel)
+   #thresholding
+      v = np.median(enhanced)
+      lower = int(max(0, 0.66*v))
+      upper = int(min(255, 1.33*v))
+      edges = cv2.Canny(sharpened, lower, upper)
+
+
+      contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+      mask = np.zeros_like(edges)
+      for cnt in contours:
+        if cv2.arcLength(cnt, True) > 30:
+         cv2.drawContours(mask, [cnt], -1, 255, -1)
+
+      # if cv2.contourArea(cnt) > 10:   # smaller threshold keeps more edges
+      #  cv2.drawContours(mask, [cnt], -1, 255, -1)
+      edges = mask
+
+      #cut images
+      edges=cut_into_4(edges)
+
+      return edges
+
+
+for root, _, files_in_folder in os.walk(extract_folder):
+    for filename in files_in_folder:
+        if filename.lower().endswith((".png",".jpg",".jpeg")):
+            img_path = os.path.join(root, filename)
+            img = cv2.imread(img_path)
+
+            edges_tuple = preprocess_2x2(img)
+            for i, part_edge in enumerate(edges_tuple):
+             show(part_edge, f"{filename} - Slice {i+1}")
