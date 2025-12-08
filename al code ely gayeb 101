@@ -1,0 +1,193 @@
+import os
+import cv2
+import numpy as np
+from itertools import permutations
+
+# ==========================================================
+# STEP 1 — COLLECT ALL *_edge.png
+# ==========================================================
+def collect_edge_images(root_folder):
+    edge_pieces = []
+    for root, dirs, files in os.walk(root_folder):
+        for f in files:
+            if f.lower().endswith("_edge.png"):
+                full_path = os.path.join(root, f)
+                img = cv2.imread(full_path, cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    print("Could not load:", full_path)
+                    continue
+                _, img_bin = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
+                edge_pieces.append({"path": full_path, "image": img_bin})
+    return edge_pieces
+
+# ==========================================================
+# STEP 2 — EXTRACT SIDES
+# ==========================================================
+def extract_sides(edge_img, border=5):
+    h, w = edge_img.shape
+    top = edge_img[0:border, :]
+    bottom = edge_img[-border:, :]
+    left = edge_img[:, 0:border]
+    right = edge_img[:, -border:]
+    return top, right, bottom, left
+
+def extract_sides_color(img, border=5):
+    h, w = img.shape[:2]
+    top = img[0:border, :, :]
+    bottom = img[-border:, :, :]
+    left = img[:, 0:border, :]
+    right = img[:, -border:, :]
+    return top, right, bottom, left
+
+# ==========================================================
+# STEP 3 — EDGE DISTANCE FUNCTIONS
+# ==========================================================
+def edge_distance_pixels(edge1, edge2):
+    diff_normal = np.sum(np.abs(edge1.astype(int) - edge2.astype(int)))
+    diff_flipped = np.sum(np.abs(edge1.astype(int) - edge2[::-1, :].astype(int)))
+    return min(diff_normal, diff_flipped)
+
+def edge_distance_color_hist(edge1, edge2):
+    # Convert to HSV
+    e1 = cv2.cvtColor(edge1, cv2.COLOR_BGR2HSV)
+    e2 = cv2.cvtColor(edge2, cv2.COLOR_BGR2HSV)
+    e2_flip = cv2.flip(e2, 0)
+
+    # Mask background by ignoring most frequent color
+    def mask_background(edge):
+        pixels = edge.reshape(-1, 3)
+        counts = {}
+        for px in map(tuple, pixels):
+            counts[px] = counts.get(px, 0) + 1
+        bg_color = max(counts, key=counts.get)
+        mask = np.any(edge != bg_color, axis=2).astype(np.uint8)
+        return mask
+
+    mask1 = mask_background(e1)
+    mask2 = mask_background(e2)
+    mask2f = mask_background(e2_flip)
+
+    hist1 = cv2.calcHist([e1], [0,1,2], mask1, [8,8,8], [0,180,0,256,0,256])
+    hist2 = cv2.calcHist([e2], [0,1,2], mask2, [8,8,8], [0,180,0,256,0,256])
+    hist2f = cv2.calcHist([e2_flip], [0,1,2], mask2f, [8,8,8], [0,180,0,256,0,256])
+
+    cv2.normalize(hist1, hist1)
+    cv2.normalize(hist2, hist2)
+    cv2.normalize(hist2f, hist2f)
+
+    sim1 = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
+    sim2 = cv2.compareHist(hist1, hist2f, cv2.HISTCMP_CORREL)
+
+    best_sim = max(sim1, sim2)
+    return 1 - best_sim
+
+# ==========================================================
+# STEP 4 — LOAD PIECES
+# ==========================================================
+def load_pieces(folder):
+    edges = collect_edge_images(folder)
+    pieces = []
+
+    for idx, item in enumerate(edges):
+        original_path = item["path"].replace("_edge.png", "_original.png")
+        original = cv2.imread(original_path)
+        if original is None:
+            print("Missing original:", original_path)
+            continue
+
+        top, right, bottom, left = extract_sides(item["image"])
+        ot, orr, ob, ol = extract_sides_color(original)
+
+        pieces.append({
+            "id": idx,
+            "edge_path": item["path"],
+            "original_path": original_path,
+            "top": top, "right": right, "bottom": bottom, "left": left,
+            "ot": ot, "or": orr, "ob": ob, "ol": ol
+        })
+    return pieces
+
+# ==========================================================
+# STEP 5 — TOTAL ERROR (Hybrid)
+# ==========================================================
+def total_error(arr, weight_pixel=0.001, weight_shape=0.0005):
+    TL, TR, BL, BR = arr
+    ERR = 0
+
+    # 1️⃣ Masked HSV histogram similarity
+    ERR += edge_distance_color_hist(TL["or"], TR["ol"])
+    ERR += edge_distance_color_hist(TL["ob"], BL["ot"])
+    ERR += edge_distance_color_hist(TR["ob"], BR["ot"])
+    ERR += edge_distance_color_hist(BL["or"], BR["ol"])
+
+    # 2️⃣ Pixel-by-pixel difference (small weight)
+    
+
+    return ERR
+
+# ==========================================================
+# STEP 6 — BRUTE FORCE SOLVER
+# ==========================================================
+def optimize_2x2_horizontal(pieces):
+    best_arrangement = pieces[:4]
+    best_error = total_error(best_arrangement)
+
+    for perm in permutations(pieces[:4]):
+        err = total_error(perm)
+        if err < best_error:
+            best_error = err
+            best_arrangement = perm
+
+    return best_arrangement
+
+# ==========================================================
+# STEP 7 — VISUALIZATION
+# ==========================================================
+def visualize_2x2_original(TL, TR, BL, BR, border=5, show=True):
+    imgs = [cv2.imread(p["original_path"]) for p in [TL, TR, BL, BR]]
+    h = max(img.shape[0] for img in imgs)
+    w = max(img.shape[1] for img in imgs)
+    imgs_resized = [cv2.resize(img, (w, h)) for img in imgs]
+
+    black_v = np.zeros((h, border, 3), dtype=np.uint8)
+    black_h = np.zeros((border, w*2 + border, 3), dtype=np.uint8)
+
+    top_row = np.hstack([imgs_resized[0], black_v, imgs_resized[1]])
+    bottom_row = np.hstack([imgs_resized[2], black_v, imgs_resized[3]])
+    full = np.vstack([top_row, black_h, bottom_row])
+
+    if show:
+        cv2.imshow("2x2 Puzzle", full)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+    return full
+
+# ==========================================================
+# STEP 8 — MAIN
+# ==========================================================
+if __name__ == "__main__":
+    base_folder = r"C:\output_to_collect"
+    output_folder = r"C:\output_to_collect\assembled_masked"
+    os.makedirs(output_folder, exist_ok=True)
+
+    for i in range(110):
+        folder = os.path.join(base_folder, str(i))
+        print("\nProcessing folder:", folder)
+
+        pieces = load_pieces(folder)
+        print("Loaded", len(pieces), "pieces")
+        if len(pieces) < 4:
+            print("Need 4 pieces")
+            continue
+
+        TL, TR, BL, BR = optimize_2x2_horizontal(pieces)
+
+        print("Best arrangement:")
+        print([p["edge_path"] for p in [TL, TR, BL, BR]])
+
+        full_img = visualize_2x2_original(TL, TR, BL, BR, show=False)
+        save_path = os.path.join(output_folder, f"puzzle_{i}.png")
+        cv2.imwrite(save_path, full_img)
+
+        print("Saved:", save_path)
