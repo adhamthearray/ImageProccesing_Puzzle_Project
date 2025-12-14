@@ -1,0 +1,247 @@
+import os
+import cv2
+import numpy as np
+from itertools import product
+
+# ==========================================================
+# STEP 1 — COLLECT ALL *_edge.png
+# ==========================================================
+def collect_edge_images(root_folder):
+    edge_pieces = []
+    for root, _, files in os.walk(root_folder):
+        for f in files:
+            if f.lower().endswith("_edge.png"):
+                path = os.path.join(root, f)
+                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    continue
+                _, img = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
+                edge_pieces.append({"path": path, "image": img})
+    return edge_pieces
+
+# ==========================================================
+# STEP 2 — EXTRACT SIDES COLOR
+# ==========================================================
+def extract_sides_color(img, border=5):
+    return (
+        img[0:border, :, :],        # top
+        img[:, -border:, :],        # right
+        img[-border:, :, :],        # bottom
+        img[:, 0:border, :]         # left
+    )
+
+# ==========================================================
+# STEP 3A — HISTOGRAM DISTANCE
+# ==========================================================
+def histogram_distance(edge1, edge2):
+    e1 = cv2.cvtColor(edge1, cv2.COLOR_BGR2HSV)
+    e2 = cv2.cvtColor(edge2, cv2.COLOR_BGR2HSV)
+    e2f = cv2.flip(e2, 0)
+
+    def bg_mask(edge):
+        pixels = edge.reshape(-1, 3)
+        colors, counts = np.unique(pixels, axis=0, return_counts=True)
+        bg = colors[np.argmax(counts)]
+        return np.any(edge != bg, axis=2).astype(np.uint8)
+
+    m1  = bg_mask(e1)
+    m2  = bg_mask(e2)
+    m2f = bg_mask(e2f)
+
+    h1  = cv2.calcHist([e1],  [0,1,2], m1,  [8,8,8], [0,180,0,256,0,256])
+    h2  = cv2.calcHist([e2],  [0,1,2], m2,  [8,8,8], [0,180,0,256,0,256])
+    h2f = cv2.calcHist([e2f], [0,1,2], m2f, [8,8,8], [0,180,0,256,0,256])
+
+    cv2.normalize(h1, h1)
+    cv2.normalize(h2, h2)
+    cv2.normalize(h2f, h2f)
+
+    sim1 = cv2.compareHist(h1, h2,  cv2.HISTCMP_CORREL)
+    sim2 = cv2.compareHist(h1, h2f, cv2.HISTCMP_CORREL)
+
+    return 1.0 - max(sim1, sim2)
+
+# ==========================================================
+# STEP 3B — PIXEL DISTANCE
+# ==========================================================
+def pixel_distance(edge1, edge2):
+    h = min(edge1.shape[0], edge2.shape[0])
+    w = min(edge1.shape[1], edge2.shape[1])
+
+    e1 = edge1[:h, :w].astype(np.int16)
+    e2 = edge2[:h, :w].astype(np.int16)
+    e2f = np.flipud(e2)
+
+    d1 = np.mean(np.abs(e1 - e2))
+    d2 = np.mean(np.abs(e1 - e2f))
+
+    return min(d1, d2)
+
+# ==========================================================
+# STEP 3C — HYBRID DISTANCE
+# ==========================================================
+def hybrid_edge_distance(edge1, edge2, w_pixel=0.8, w_hist=0.2):
+    pd = pixel_distance(edge1, edge2)
+    hd = histogram_distance(edge1, edge2)
+    pd_norm = pd / 255.0
+    return w_pixel * pd_norm + w_hist * hd
+
+# ==========================================================
+# STEP 4 — LOAD PIECES
+# ==========================================================
+def load_pieces(folder):
+    edges = collect_edge_images(folder)
+    pieces = []
+
+    for idx, item in enumerate(edges):
+        orig_path = item["path"].replace("_edge.png", "_original.png")
+        original = cv2.imread(orig_path)
+        if original is None:
+            continue
+        ot, or_, ob, ol = extract_sides_color(original)
+        pieces.append({
+            "id": idx,
+            "original_path": orig_path,
+            "ot": ot, "or": or_, "ob": ob, "ol": ol
+        })
+    return pieces
+
+# ==========================================================
+# STEP 5 — PRECOMPUTE DISTANCES
+# ==========================================================
+def precompute_all_distances(pieces):
+    N = len(pieces)
+    dist = [[{} for _ in range(N)] for _ in range(N)]
+    for i in range(N):
+        for j in range(N):
+            if i == j: continue
+            dist[i][j]["right"] = hybrid_edge_distance(pieces[i]["or"], pieces[j]["ol"])
+            dist[i][j]["bottom"] = hybrid_edge_distance(pieces[i]["ob"], pieces[j]["ot"])
+    return dist
+
+# ==========================================================
+# STEP 6 — TOTAL GRID ERROR
+# ==========================================================
+def total_error_grid(grid):
+    N = len(grid)
+    err = 0
+    for r in range(N):
+        for c in range(N):
+            if c < N-1:
+                err += hybrid_edge_distance(grid[r][c]["or"], grid[r][c+1]["ol"])
+            if r < N-1:
+                err += hybrid_edge_distance(grid[r][c]["ob"], grid[r+1][c]["ot"])
+    return err
+
+# ==========================================================
+# STEP 7 — GREEDY 4×4 FILL
+# ==========================================================
+def greedy_fill_grid(pieces, dist, N=4):
+    best_grid = None
+    best_err = float("inf")
+    for start in range(len(pieces)):
+        used = {start}
+        grid = [[None]*N for _ in range(N)]
+        grid[0][0] = pieces[start]
+
+        for c in range(1, N):
+            left_idx = pieces.index(grid[0][c-1])
+            cand = [i for i in range(len(pieces)) if i not in used]
+            best = min(cand, key=lambda x: dist[left_idx][x]["right"])
+            grid[0][c] = pieces[best]
+            used.add(best)
+
+        for r in range(1, N):
+            for c in range(N):
+                above_idx = pieces.index(grid[r-1][c])
+                cand = [i for i in range(len(pieces)) if i not in used]
+                if c == 0:
+                    best = min(cand, key=lambda x: dist[above_idx][x]["bottom"])
+                else:
+                    left_idx = pieces.index(grid[r][c-1])
+                    best = min(cand, key=lambda x: dist[above_idx][x]["bottom"] + dist[left_idx][x]["right"])
+                grid[r][c] = pieces[best]
+                used.add(best)
+
+        err = total_error_grid(grid)
+        if err < best_err:
+            best_err = err
+            best_grid = grid
+    return best_grid, best_err
+
+# ==========================================================
+# STEP 8 — 2-PASS REFINEMENT
+# ==========================================================
+def refine_grid(grid, max_iter=5):
+    N = len(grid)
+    current_err = total_error_grid(grid)
+    for _ in range(max_iter):
+        improved = False
+        for r1 in range(N):
+            for c1 in range(N):
+                for r2 in range(N):
+                    for c2 in range(N):
+                        if (r1, c1) >= (r2, c2):  # avoid duplicate/self-swap
+                            continue
+                        grid[r1][c1], grid[r2][c2] = grid[r2][c2], grid[r1][c1]
+                        new_err = total_error_grid(grid)
+                        if new_err < current_err:
+                            current_err = new_err
+                            improved = True
+                        else:
+                            grid[r1][c1], grid[r2][c2] = grid[r2][c2], grid[r1][c1]
+        if not improved:
+            break
+    return grid
+
+# ==========================================================
+# STEP 9 — VISUALIZATION
+# ==========================================================
+def visualize_NxN_original(grid, border=5):
+    N = len(grid)
+    imgs = [[cv2.imread(grid[r][c]["original_path"]) for c in range(N)] for r in range(N)]
+    h = max(i.shape[0] for row in imgs for i in row)
+    w = max(i.shape[1] for row in imgs for i in row)
+    imgs = [[cv2.resize(i, (w, h)) for i in row] for row in imgs]
+
+    black_v = np.zeros((h, border, 3), np.uint8)
+    black_h = np.zeros((border, w*N + border*(N-1), 3), np.uint8)
+
+    rows = []
+    for r in range(N):
+        row = []
+        for c in range(N):
+            row.append(imgs[r][c])
+            if c < N-1:
+                row.append(black_v)
+        rows.append(np.hstack(row))
+
+    full = rows[0]
+    for r in range(1, N):
+        full = np.vstack([full, black_h, rows[r]])
+    return full
+
+# ==========================================================
+# STEP 10 — MAIN
+# ==========================================================
+if __name__ == "__main__":
+    base = r"C:\Image_project\output_to_collect_4x4"
+    out  = r"C:\Image_project\output_4x4_refined"
+    os.makedirs(out, exist_ok=True)
+
+    for i in range(110):
+        folder = os.path.join(base, str(i))
+        print("Processing", folder)
+
+        pieces = load_pieces(folder)
+        if len(pieces) < 16:
+            continue
+
+        dist = precompute_all_distances(pieces)
+        grid, err = greedy_fill_grid(pieces, dist, N=4)
+
+        grid = refine_grid(grid, max_iter=5)
+
+        img = visualize_NxN_original(grid)
+        cv2.imwrite(os.path.join(out, f"puzzle_{i}.png"), img)
+        print(f"Puzzle {i} error = {total_error_grid(grid):.4f}")
