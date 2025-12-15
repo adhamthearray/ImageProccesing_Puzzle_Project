@@ -1,0 +1,159 @@
+import numpy as np
+import heapq
+import cv2
+import os
+
+class Tile:
+    def __init__(self, index, img):
+        self.index = index
+        self.img = img
+        self.lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype("float32")
+
+def calc_pair_cost(t1, t2, direction):
+    if direction == 0:  # right
+        b1, b2 = t1[:, -1, :], t2[:, 0, :]
+        d1, d2 = t1[:, -2, :], t2[:, 1, :]
+    else:  # bottom
+        b1, b2 = t1[-1, :, :], t2[0, :, :]
+        d1, d2 = t1[-2, :, :], t2[1, :, :]
+    diff = b1 - b2
+    cost_p = np.sum(np.sqrt(np.sum(diff ** 2, axis=1)))
+    grad_t1 = b1 - d1
+    grad_t2 = d2 - b2
+    grad_seam = b2 - b1
+    cost_g = np.sum(np.sqrt(np.sum((grad_seam - grad_t1) ** 2, axis=1))) + \
+             np.sum(np.sqrt(np.sum((grad_seam - grad_t2) ** 2, axis=1)))
+    return 0.75 * cost_p + 0.25 * cost_g
+
+def solve_global_beam(tiles, n, K=1):
+    nt = len(tiles)
+    if nt != n*n: return None
+
+    labs = [t.lab for t in tiles]
+
+    costs = np.zeros((nt, nt, 2), dtype=np.float32)
+    for i in range(nt):
+        for j in range(nt):
+            if i == j: continue
+            costs[i, j, 0] = calc_pair_cost(labs[i], labs[j], 0)
+            costs[i, j, 1] = calc_pair_cost(labs[i], labs[j], 1)
+
+    def seed_initial_grid(seed_idx):
+        grid = np.full((n,n), -1, dtype=int)
+        grid[0,0] = seed_idx
+        used = {seed_idx}
+        if n>=2:
+            best_r = min((costs[seed_idx,j,0],j) for j in range(nt) if j not in used)[1]
+            grid[0,1] = best_r; used.add(best_r)
+            best_b = min((costs[seed_idx,j,1],j) for j in range(nt) if j not in used)[1]
+            grid[1,0] = best_b; used.add(best_b)
+            best_d = min((costs[best_b,j,0]+costs[best_r,j,1],j) for j in range(nt) if j not in used)[1]
+            grid[1,1] = best_d; used.add(best_d)
+        return grid, used
+
+    best_grid = None
+    best_energy = float("inf")
+
+    for seed in range(nt):
+        initial_grid, initial_used = seed_initial_grid(seed)
+        beam = [(initial_grid, initial_used, 0.0)]
+        while True:
+            new_beam = []
+            expanded = False
+            for grid, used, energy in beam:
+                empties = [(r,c) for r in range(n) for c in range(n) if grid[r,c]==-1]
+                if not empties:
+                    if energy<best_energy:
+                        best_energy=energy
+                        best_grid=grid.copy()
+                    continue
+                expanded=True
+                r,c = empties[0]
+                for cand in range(nt):
+                    if cand in used: continue
+                    cost_here = 0.0
+                    if c>0: cost_here += costs[grid[r,c-1], cand,0]
+                    if r>0: cost_here += costs[grid[r-1,c], cand,1]
+                    new_grid = grid.copy()
+                    new_grid[r,c] = cand
+                    new_used = used.copy(); new_used.add(cand)
+                    new_energy = energy + cost_here
+                    new_beam.append((new_grid,new_used,new_energy))
+            if not expanded: break
+            beam = sorted(new_beam, key=lambda x:x[2])[:K]
+
+    # ---------------- Local Swap Refinement ----------------
+    def refine_grid(grid, max_iter=5):
+        def total_energy(g):
+            energy = 0.0
+            for r in range(n):
+                for c in range(n):
+                    if c < n-1: energy += costs[g[r,c], g[r,c+1], 0]
+                    if r < n-1: energy += costs[g[r,c], g[r+1,c], 1]
+            return energy
+        current_grid = grid.copy()
+        for _ in range(max_iter):
+            improved = False
+            for r1 in range(n):
+                for c1 in range(n):
+                    for r2 in range(n):
+                        for c2 in range(n):
+                            if r1==r2 and c1==c2: continue
+                            current_grid[r1,c1], current_grid[r2,c2] = current_grid[r2,c2], current_grid[r1,c1]
+                            if total_energy(current_grid) < total_energy(grid):
+                                grid = current_grid.copy()
+                                improved = True
+                            else:
+                                current_grid[r1,c1], current_grid[r2,c2] = current_grid[r2,c2], current_grid[r1,c1]
+            if not improved: break
+        return grid
+
+    if best_grid is not None:
+        best_grid = refine_grid(best_grid, max_iter=5)
+
+    return best_grid
+
+def load_tiles(folder, n):
+    files = sorted(f for f in os.listdir(folder) if f.lower().endswith("_original.png"))
+    tiles = []
+    for i,f in enumerate(files):
+        img = cv2.imread(os.path.join(folder,f))
+        if img is not None:
+            tiles.append(Tile(i,img))
+    return tiles
+
+def visualize_grid(tiles, grid, border=5):
+    n = grid.shape[0]
+    imgs = [[tiles[grid[r,c]].img for c in range(n)] for r in range(n)]
+    h = max(im.shape[0] for row in imgs for im in row)
+    w = max(im.shape[1] for row in imgs for im in row)
+    imgs = [[cv2.resize(im,(w,h)) for im in row] for row in imgs]
+    black_v = np.zeros((h,border,3), np.uint8)
+    black_h = np.zeros((border,w*n + border*(n-1),3), np.uint8)
+    rows=[]
+    for r in range(n):
+        row=[]
+        for c in range(n):
+            row.append(imgs[r][c])
+            if c<n-1: row.append(black_v)
+        rows.append(np.hstack(row))
+    full=rows[0]
+    for r in range(1,n): full=np.vstack([full, black_h, rows[r]])
+    return full
+
+if __name__=="__main__":
+    BASE = r"C:\Image_project\output_to_collect_4x4"
+    OUT  = r"C:\Image_project\output_beam_frontier_4x4_refined"
+    os.makedirs(OUT, exist_ok=True)
+    N = 4
+    K = 1  # greedy enough for 4x4
+    for i in range(110):
+        folder = os.path.join(BASE,str(i))
+        if not os.path.isdir(folder): continue
+        tiles = load_tiles(folder,N)
+        if len(tiles)!=N*N: continue
+        grid = solve_global_beam(tiles,N,K)
+        if grid is None: continue
+        img = visualize_grid(tiles,grid)
+        cv2.imwrite(os.path.join(OUT,f"puzzle_4x4_{i}.png"),img)
+        print("Saved 4x4 puzzle",i)
