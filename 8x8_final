@@ -1,0 +1,211 @@
+import os
+import cv2
+import numpy as np
+
+# ==========================================================
+# STEP 1 — COLLECT *_edge.png IMAGES
+# ==========================================================
+def collect_edge_pieces(folder_path):
+    edge_pieces = []
+    for root, _, files in os.walk(folder_path):
+        for f in files:
+            if f.lower().endswith("_edge.png"):
+                path = os.path.join(root, f)
+                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    continue
+                _, img = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
+                edge_pieces.append({"path": path, "image": img})
+    return edge_pieces
+
+# ==========================================================
+# STEP 2 — EXTRACT SIDE REGIONS
+# ==========================================================
+def get_piece_sides(image, border=5):
+    return (
+        image[0:border, :, :],        # top
+        image[:, -border:, :],        # right
+        image[-border:, :, :],        # bottom
+        image[:, 0:border, :]         # left
+    )
+
+# ==========================================================
+# STEP 3 — LOAD ALL PIECES
+# ==========================================================
+def load_puzzle_pieces(folder):
+    edges = collect_edge_pieces(folder)
+    pieces = []
+
+    for idx, item in enumerate(edges):
+        orig_path = item["path"].replace("_edge.png", "_original.png")
+        original = cv2.imread(orig_path)
+        if original is None:
+            continue
+
+        top, right, bottom, left = get_piece_sides(original)
+        lab_image = cv2.cvtColor(original, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+        pieces.append({
+            "id": idx,
+            "original": original,
+            "lab": lab_image,
+            "top": top, "right": right, "bottom": bottom, "left": left
+        })
+
+    return pieces
+
+# ==========================================================
+# STEP 4 — COMPUTE EDGE MATCH COSTS
+# ==========================================================
+def compute_edge_costs(pieces):
+    N = len(pieces)
+    horizontal_costs = np.full((N, N), np.inf)
+    vertical_costs = np.full((N, N), np.inf)
+
+    for i in range(N):
+        for j in range(N):
+            if i == j:
+                continue
+            horizontal_costs[i, j] = np.sum(np.abs(pieces[i]["lab"][:, -1] - pieces[j]["lab"][:, 0]))
+            vertical_costs[i, j] = np.sum(np.abs(pieces[i]["lab"][-1] - pieces[j]["lab"][0]))
+
+    return horizontal_costs, vertical_costs
+
+# ==========================================================
+# STEP 5 — APPLY BEST-BUDDIES BONUS
+# ==========================================================
+def mark_best_buddies(horizontal_costs, vertical_costs, bonus=10000):
+    N = horizontal_costs.shape[0]
+    seeds = set()
+
+    # Horizontal best buddies
+    fwd = np.argmin(horizontal_costs, axis=1)
+    bwd = np.argmin(horizontal_costs, axis=0)
+    for i in range(N):
+        j = fwd[i]
+        if bwd[j] == i:
+            horizontal_costs[i, j] -= bonus
+            seeds.add(i)
+
+    # Vertical best buddies
+    fwd = np.argmin(vertical_costs, axis=1)
+    bwd = np.argmin(vertical_costs, axis=0)
+    for i in range(N):
+        j = fwd[i]
+        if bwd[j] == i:
+            vertical_costs[i, j] -= bonus
+            seeds.add(i)
+
+    return list(seeds)
+
+# ==========================================================
+# STEP 6 — FRONTIER GREEDY SOLVER
+# ==========================================================
+def greedy_puzzle_solver(pieces, horizontal_costs, vertical_costs, N, seeds):
+    best_grid = None
+    best_energy = float("inf")
+
+    for seed in seeds:
+        grid = {(0, 0): seed}
+        used = {seed}
+        frontier = {(0,1),(1,0),(-1,0),(0,-1)}
+        energy = 0
+
+        while len(used) < N*N:
+            best_option = None
+
+            rs = [r for r,_ in grid]
+            cs = [c for _,c in grid]
+            min_r, max_r = min(rs), max(rs)
+            min_c, max_c = min(cs), max(cs)
+
+            for r, c in list(frontier):
+                h = max(max_r, r) - min(min_r, r) + 1
+                w = max(max_c, c) - min(min_c, c) + 1
+                if h > N or w > N:
+                    continue
+
+                for pid in range(len(pieces)):
+                    if pid in used:
+                        continue
+
+                    cost = 0
+                    if (r, c-1) in grid:
+                        cost += horizontal_costs[grid[(r,c-1)], pid]
+                    if (r, c+1) in grid:
+                        cost += horizontal_costs[pid, grid[(r,c+1)]]
+                    if (r-1, c) in grid:
+                        cost += vertical_costs[grid[(r-1,c)], pid]
+                    if (r+1, c) in grid:
+                        cost += vertical_costs[pid, grid[(r+1,c)]]
+
+                    if best_option is None or cost < best_option[0]:
+                        best_option = (cost, r, c, pid)
+
+            if best_option is None:
+                break
+
+            cost, r, c, pid = best_option
+            grid[(r, c)] = pid
+            used.add(pid)
+            energy += cost
+            frontier.remove((r, c))
+
+            for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                if (r+dr, c+dc) not in grid:
+                    frontier.add((r+dr, c+dc))
+
+        if energy < best_energy:
+            best_energy = energy
+            best_grid = grid
+
+    return best_grid
+
+# ==========================================================
+# STEP 7 — VISUALIZE SOLVED PUZZLE
+# ==========================================================
+def assemble_puzzle_image(grid, pieces, N):
+    coords = list(grid.keys())
+    min_r = min(r for r, _ in coords)
+    min_c = min(c for _, c in coords)
+
+    imgs = [[None] * N for _ in range(N)]
+    for (r, c), pid in grid.items():
+        imgs[r - min_r][c - min_c] = pieces[pid]["original"]
+
+    h = max(img.shape[0] for row in imgs for img in row)
+    w = max(img.shape[1] for row in imgs for img in row)
+    imgs = [[cv2.resize(img, (w, h)) for img in row] for row in imgs]
+
+    full_rows = [np.hstack(row) for row in imgs]
+    full_img = np.vstack(full_rows)
+    return full_img
+
+# ==========================================================
+# STEP 8 — MAIN EXECUTION
+# ==========================================================
+if __name__ == "__main__":
+    base_folder = r"C:\Image_project\output_to_collect_8x8"
+    output_folder = r"C:\final_image_results\8x8"
+    os.makedirs(output_folder, exist_ok=True)
+
+    for i in range(110):
+        folder = os.path.join(base_folder, str(i))
+        print("Processing", folder)
+
+        pieces = load_puzzle_pieces(folder)
+        if len(pieces) < 64:
+            continue
+
+        h_costs, v_costs = compute_edge_costs(pieces)
+        seeds = mark_best_buddies(h_costs, v_costs)
+
+        if not seeds:
+            seeds = [0]
+
+        grid = greedy_puzzle_solver(pieces, h_costs, v_costs, N=8, seeds=seeds)
+
+        final_img = assemble_puzzle_image(grid, pieces, N=8)
+        cv2.imwrite(os.path.join(output_folder, f"puzzle_{i}.png"), final_img)
+
+        print(f"Saved puzzle {i}")
