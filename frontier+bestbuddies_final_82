@@ -1,0 +1,222 @@
+import os
+import cv2
+import numpy as np
+
+# ==========================================================
+# 1 — COLLECT *_edge.png
+# ==========================================================
+def collect_edge_images(root_folder):
+    edge_pieces = []
+    for root, _, files in os.walk(root_folder):
+        for f in files:
+            if f.lower().endswith("_edge.png"):
+                path = os.path.join(root, f)
+                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                if img is None:
+                    continue
+                _, img = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
+                edge_pieces.append({"path": path, "image": img})
+    return edge_pieces
+
+# ==========================================================
+# 2 — EXTRACT SIDES COLOR
+# ==========================================================
+def extract_sides_color(img, border=5):
+    return (
+        img[0:border, :, :],        # top
+        img[:, -border:, :],        # right
+        img[-border:, :, :],        # bottom
+        img[:, 0:border, :]         # left
+    )
+
+# ==========================================================
+# 3 — LOAD PIECES
+# ==========================================================
+def load_pieces(folder):
+    edges = collect_edge_images(folder)
+    pieces = []
+
+    for idx, item in enumerate(edges):
+        orig_path = item["path"].replace("_edge.png", "_original.png")
+        original = cv2.imread(orig_path)
+        if original is None:
+            continue
+
+        ot, or_, ob, ol = extract_sides_color(original)
+        lab = cv2.cvtColor(original, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+        pieces.append({
+            "id": idx,
+            "original": original,
+            "lab": lab,
+            "ot": ot, "or": or_, "ob": ob, "ol": ol
+        })
+
+    return pieces
+
+# ==========================================================
+# 4 — PRECOMPUTE EDGE COSTS
+# ==========================================================
+def precompute_costs(pieces):
+    N = len(pieces)
+    cost_h = np.full((N, N), np.inf)
+    cost_v = np.full((N, N), np.inf)
+
+    for i in range(N):
+        for j in range(N):
+            if i == j:
+                continue
+            cost_h[i, j] = np.sum(np.abs(pieces[i]["lab"][:, -1] - pieces[j]["lab"][:, 0]))
+            cost_v[i, j] = np.sum(np.abs(pieces[i]["lab"][-1] - pieces[j]["lab"][0]))
+
+    return cost_h, cost_v
+
+# ==========================================================
+# 5 — BEST BUDDIES
+# ==========================================================
+def apply_best_buddies(cost_h, cost_v, bonus=10000):
+    N = cost_h.shape[0]
+    seeds = set()
+
+    # Horizontal
+    fwd = np.argmin(cost_h, axis=1)
+    bwd = np.argmin(cost_h, axis=0)
+    for i in range(N):
+        j = fwd[i]
+        if bwd[j] == i:
+            cost_h[i, j] -= bonus
+            seeds.add(i)
+
+    # Vertical
+    fwd = np.argmin(cost_v, axis=1)
+    bwd = np.argmin(cost_v, axis=0)
+    for i in range(N):
+        j = fwd[i]
+        if bwd[j] == i:
+            cost_v[i, j] -= bonus
+            seeds.add(i)
+
+    return list(seeds)
+
+# ==========================================================
+# 6 — FRONTIER GREEDY SOLVER
+# ==========================================================
+def solve_frontier(pieces, cost_h, cost_v, N, seeds):
+    best_grid = None
+    best_energy = float("inf")
+
+    for seed in seeds:
+        grid = {(0, 0): seed}
+        used = {seed}
+        frontier = {(0,1),(1,0),(-1,0),(0,-1)}
+        energy = 0
+
+        while len(used) < N*N:
+            best = None
+
+            rs = [r for r,_ in grid]
+            cs = [c for _,c in grid]
+            min_r, max_r = min(rs), max(rs)
+            min_c, max_c = min(cs), max(cs)
+
+            for r,c in list(frontier):
+                h = max(max_r, r) - min(min_r, r) + 1
+                w = max(max_c, c) - min(min_c, c) + 1
+                if h > N or w > N:
+                    continue
+
+                for pid in range(len(pieces)):
+                    if pid in used:
+                        continue
+
+                    cost = 0
+                    if (r, c-1) in grid:
+                        cost += cost_h[grid[(r,c-1)], pid]
+                    if (r, c+1) in grid:
+                        cost += cost_h[pid, grid[(r,c+1)]]
+                    if (r-1, c) in grid:
+                        cost += cost_v[grid[(r-1,c)], pid]
+                    if (r+1, c) in grid:
+                        cost += cost_v[pid, grid[(r+1,c)]]
+
+                    if best is None or cost < best[0]:
+                        best = (cost, r, c, pid)
+
+            if best is None:
+                break
+
+            cost, r, c, pid = best
+            grid[(r,c)] = pid
+            used.add(pid)
+            energy += cost
+            frontier.remove((r,c))
+
+            for dr,dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                if (r+dr, c+dc) not in grid:
+                    frontier.add((r+dr, c+dc))
+
+        if energy < best_energy:
+            best_energy = energy
+            best_grid = grid
+
+    return best_grid
+
+# ==========================================================
+# 7 — VISUALIZE NxN
+# ==========================================================
+def visualize_NxN_original(grid, pieces, N, border=5):
+    coords = list(grid.keys())
+    min_r = min(r for r,_ in coords)
+    min_c = min(c for _,c in coords)
+
+    imgs = [[None]*N for _ in range(N)]
+    for (r,c), pid in grid.items():
+        imgs[r-min_r][c-min_c] = pieces[pid]["original"]
+
+    h = max(img.shape[0] for row in imgs for img in row)
+    w = max(img.shape[1] for row in imgs for img in row)
+    imgs = [[cv2.resize(img,(w,h)) for img in row] for row in imgs]
+
+    black_v = np.zeros((h,border,3), np.uint8)
+    black_h = np.zeros((border,w*N+border*(N-1),3), np.uint8)
+
+    rows=[]
+    for r in range(N):
+        row=[]
+        for c in range(N):
+            row.append(imgs[r][c])
+            if c<N-1: row.append(black_v)
+        rows.append(np.hstack(row))
+
+    full = rows[0]
+    for r in range(1,N):
+        full = np.vstack([full, black_h, rows[r]])
+    return full
+
+# ==========================================================
+# 8 — MAIN LOOP
+# ==========================================================
+if __name__ == "__main__":
+    base = r"C:\Image_project\output_to_collect_4x4"
+    out  = r"C:\Image_project\output_4x4_som3a"
+    os.makedirs(out, exist_ok=True)
+
+    for i in range(110):
+        folder = os.path.join(base, str(i))
+        print("Processing", folder)
+
+        pieces = load_pieces(folder)
+        if len(pieces) < 16:
+            continue
+
+        cost_h, cost_v = precompute_costs(pieces)
+        seeds = apply_best_buddies(cost_h, cost_v)
+
+        if not seeds:
+            seeds = [0]
+
+        grid = solve_frontier(pieces, cost_h, cost_v, N=4, seeds=seeds)
+        img = visualize_NxN_original(grid, pieces, N=4)
+        cv2.imwrite(os.path.join(out, f"puzzle_{i}.png"), img)
+
+        print(f"Saved puzzle {i}")
