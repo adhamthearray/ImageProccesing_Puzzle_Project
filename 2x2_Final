@@ -79,7 +79,7 @@ def edge_distance_color_hist(edge1, edge2):
     sim2 = cv2.compareHist(hist1, hist2f, cv2.HISTCMP_CORREL)
 
     best_sim = max(sim1, sim2)
-    return 1 - best_sim
+    return 1 - best_sim  # 0 = perfect match, larger = worse
 
 # ==========================================================
 # STEP 4 — LOAD PIECES
@@ -108,7 +108,7 @@ def load_pieces(folder):
     return pieces
 
 # ==========================================================
-# STEP 5 — TOTAL ERROR (Hybrid)
+# STEP 5 — TOTAL ERROR (Hybrid for 2x2)
 # ==========================================================
 def total_error(arr, weight_pixel=0.001, weight_shape=0.0005):
     TL, TR, BL, BR = arr
@@ -120,13 +120,91 @@ def total_error(arr, weight_pixel=0.001, weight_shape=0.0005):
     ERR += edge_distance_color_hist(TR["ob"], BR["ot"])
     ERR += edge_distance_color_hist(BL["or"], BR["ol"])
 
-    # 2️⃣ Pixel-by-pixel difference (small weight)
-    
+    # 2️⃣ Pixel-by-pixel difference (could be added with small weight)
+    # e.g.:
+    # ERR += weight_pixel * edge_distance_pixels(TL["right"], TR["left"])
+    # ...
 
     return ERR
 
 # ==========================================================
-# STEP 6 — BRUTE FORCE SOLVER
+# STEP 5b — COMPUTE "BAD SIDES" & CHOOSE FIRST PIECE
+# ==========================================================
+def compute_best_side_costs(pieces):
+    """
+    For each piece i, compute the best possible match cost for each side:
+    top, right, bottom, left.
+    """
+    N = len(pieces)
+    INF = 1e9
+    best_top    = np.full(N, INF, dtype=np.float32)
+    best_right  = np.full(N, INF, dtype=np.float32)
+    best_bottom = np.full(N, INF, dtype=np.float32)
+    best_left   = np.full(N, INF, dtype=np.float32)
+
+    for i in range(N):
+        for j in range(N):
+            if i == j:
+                continue
+
+            # j below i: match bottom of i with top of j
+            cost_down = edge_distance_color_hist(pieces[i]["ob"], pieces[j]["ot"])
+            if cost_down < best_bottom[i]:
+                best_bottom[i] = cost_down
+
+            # j above i: match top of i with bottom of j
+            cost_up = edge_distance_color_hist(pieces[i]["ot"], pieces[j]["ob"])
+            if cost_up < best_top[i]:
+                best_top[i] = cost_up
+
+            # j right of i: match right of i with left of j
+            cost_right = edge_distance_color_hist(pieces[i]["or"], pieces[j]["ol"])
+            if cost_right < best_right[i]:
+                best_right[i] = cost_right
+
+            # j left of i: match left of i with right of j
+            cost_left = edge_distance_color_hist(pieces[i]["ol"], pieces[j]["or"])
+            if cost_left < best_left[i]:
+                best_left[i] = cost_left
+
+    return best_top, best_right, best_bottom, best_left
+
+def choose_first_piece_top_left(pieces):
+    """
+    Choose a top-left corner candidate:
+    - bad TOP side  (no good match above)
+    - bad LEFT side (no good match left)
+    'Bad' means best match cost > threshold (e.g., 75th percentile).
+    """
+    best_top, best_right, best_bottom, best_left = compute_best_side_costs(pieces)
+
+    # collect all best-side costs to estimate what's "large"
+    all_vals = np.concatenate([best_top, best_right, best_bottom, best_left])
+    thr = np.percentile(all_vals, 75)  # sides worse than this are considered "bad"
+
+    candidates = []
+    for i in range(len(pieces)):
+        bad_top  = best_top[i]  > thr
+        bad_left = best_left[i] > thr
+        if bad_top and bad_left:
+            # score: how strong a corner it is (bigger = more "bad")
+            score = best_top[i] + best_left[i]
+            candidates.append((score, i))
+
+    if candidates:
+        # choose the piece with the worst (largest) sum of top+left
+        candidates.sort(reverse=True)
+        start_idx = candidates[0][1]
+    else:
+        # fallback: just pick the piece with largest (top+left)
+        scores = [(best_top[i] + best_left[i], i) for i in range(len(pieces))]
+        scores.sort(reverse=True)
+        start_idx = scores[0][1]
+
+    return start_idx, (best_top, best_right, best_bottom, best_left), thr
+
+# ==========================================================
+# STEP 6 — BRUTE FORCE SOLVER (2x2)
 # ==========================================================
 def optimize_2x2_horizontal(pieces):
     best_arrangement = pieces[:4]
@@ -167,8 +245,8 @@ def visualize_2x2_original(TL, TR, BL, BR, border=5, show=True):
 # STEP 8 — MAIN
 # ==========================================================
 if __name__ == "__main__":
-    base_folder = r"C:\output_to_collect"
-    output_folder = r"C:\output_to_collect\assembled_masked"
+    base_folder = r"C:\image_project\output_to_collect"
+    output_folder = r"C:\final_image_results\2x2"
     os.makedirs(output_folder, exist_ok=True)
 
     for i in range(110):
@@ -181,6 +259,12 @@ if __name__ == "__main__":
             print("Need 4 pieces")
             continue
 
+        # 🔹 NEW: choose first piece as top-left corner candidate (for analysis / future NxN)
+        start_idx, (btop, bright, bbottom, bleft), thr = choose_first_piece_top_left(pieces)
+        print("Corner-based start (top-left) piece:", pieces[start_idx]["edge_path"])
+        print("Threshold for 'bad' side:", thr)
+
+        # still using full brute force for 2x2:
         TL, TR, BL, BR = optimize_2x2_horizontal(pieces)
 
         print("Best arrangement:")
